@@ -29,6 +29,7 @@ limitations under the License.
 #include "request/request.h"
 #include "request_tracer.h"
 #include "xllm_http_service.pb.h"
+#include "scheduler/request_context.h"
 
 namespace xllm_service {
 
@@ -81,6 +82,10 @@ class XllmHttpServiceImpl : public proto::XllmHttpService {
               const std::string& req_attachment,
               std::shared_ptr<Request> request,
               const std::string& method);
+
+  void handle(std::shared_ptr<RequestContext> req_context);
+
+  void rehandle(std::shared_ptr<RequestContext> req_context);
 
   void get_serving(const std::string& serving_method,
                    ::google::protobuf::RpcController* controller,

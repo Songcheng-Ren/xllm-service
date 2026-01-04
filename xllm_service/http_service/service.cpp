@@ -33,6 +33,7 @@ limitations under the License.
 #include "common/xllm/uuid.h"
 #include "completion.pb.h"
 #include "scheduler/scheduler.h"
+#include "scheduler/request_context.h"
 
 namespace xllm_service {
 
@@ -57,6 +58,10 @@ XllmHttpServiceImpl::XllmHttpServiceImpl(const Options& options,
   thread_pool_ = std::make_unique<ThreadPool>(options_.num_threads());
   request_tracer_ =
       std::make_unique<RequestTracer>(options_.enable_request_trace());
+  scheduler_->register_request_rehandle_callback(
+      [this](std::shared_ptr<RequestContext> req_context) {
+        this->rehandle(req_context);
+      });
 }
 
 XllmHttpServiceImpl::~XllmHttpServiceImpl() {}
@@ -108,6 +113,28 @@ void handle_first_response(brpc::Controller* cntl,
     call_data->write(cntl->response_attachment().to_string());
   }
   // non-stream, all generated tokens will be sent from decode via rpc service.
+}
+
+
+void handle_first_response(brpc::Controller* cntl,
+                           std::shared_ptr<RequestContext> req_context,
+                           bool stream, int attempt) {
+  if (attempt != req_context->attempt()) {
+    LOG(INFO) << "Request has been rehandled, service_request_id: "
+              << req_context->request()->service_request_id
+              << ", attempt: " << attempt;
+    return;
+  }
+  LOG(INFO) << "First response, service_request_id: "
+            << req_context->request()->service_request_id;
+  std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+  if (cntl->Failed()) {
+    LOG(WARNING) << "First response failed, " << cntl->ErrorText();
+    return;
+  }
+  if (stream) {
+    req_context->write(cntl->response_attachment().to_string());
+  }
 }
 
 template <typename T>
@@ -399,9 +426,13 @@ void XllmHttpServiceImpl::Completions(
     return;
   }
 
-  auto call_data = std::make_shared<CompletionCallData>(
-      cntl, service_request->stream, done_guard.release(), resp_pb);
-  handle(call_data, req_attachment, service_request, "/v1/completions");
+  auto call_data = std::make_shared<CompletionCallData>(cntl, service_request->stream, nullptr, resp_pb);
+
+  auto req_context = std::make_shared<RequestContext>(call_data, std::make_shared<std::string>(req_attachment), service_request, "/v1/completions", done_guard.release());
+
+  scheduler_->record_new_request_context(req_context);
+  
+  handle(req_context);
 }
 
 void XllmHttpServiceImpl::ChatCompletions(
@@ -469,9 +500,13 @@ void XllmHttpServiceImpl::ChatCompletions(
     return;
   }
 
-  auto call_data = std::make_shared<ChatCallData>(
-      cntl, service_request->stream, done_guard.release(), resp_pb);
-  handle(call_data, req_attachment, service_request, "/v1/chat/completions");
+  auto call_data = std::make_shared<ChatCallData>(cntl, service_request->stream, nullptr, resp_pb);
+
+  auto req_context = std::make_shared<RequestContext>(call_data, std::make_shared<std::string>(req_attachment), service_request, "/v1/chat/completions", done_guard.release());
+
+  scheduler_->record_new_request_context(req_context);
+  
+  handle(req_context);
 }
 
 void XllmHttpServiceImpl::Embeddings(
@@ -505,6 +540,108 @@ void XllmHttpServiceImpl::Metrics(::google::protobuf::RpcController* controller,
                                   proto::HttpResponse* response,
                                   ::google::protobuf::Closure* done) {
   get_serving("/metrics", controller, request, response, done);
+}
+
+
+void XllmHttpServiceImpl::handle(std::shared_ptr<RequestContext> req_context) {
+  LOG(INFO) << "Handle request, service_request_id: "
+            << req_context->request()->service_request_id
+            << ", attempt: " << req_context->attempt();
+  
+  // record request when enable_decode_response_to_service.
+  if (enable_decode_response_to_service_) {
+    bool success = false;
+    if (auto call_data = req_context->call_data_as<CompletionCallData>()) {
+      success = scheduler_->record_new_request(call_data, req_context->request());
+    } else if (auto call_data = req_context->call_data_as<ChatCallData>()) {
+      success = scheduler_->record_new_request(call_data, req_context->request());
+    }
+    if (!success) {
+      LOG(ERROR) << "rpc service add new request error: "
+                 << req_context->request()->service_request_id;
+      scheduler_->finish_request(req_context->request()->service_request_id);
+      return;
+    }
+  }
+  
+  // async redistribute the request and wait the response
+  // TODO: optimize the thread pool to async mode.
+  auto& target_uri = req_context->request()->routing.prefill_name;
+  brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
+
+  // send request to prefill instance.
+  thread_pool_->schedule([this,
+                          req_context,
+                          channel_ptr,
+                          target_uri = target_uri + req_context->method()]() {
+    brpc::Controller* redirect_cntl = new brpc::Controller();
+    redirect_cntl->http_request().uri() = target_uri.c_str();
+    redirect_cntl->http_request().set_method(brpc::HTTP_METHOD_POST);
+
+    // redirect the input request content
+    redirect_cntl->request_attachment().append(req_context->req_attachment()->c_str());
+
+    // 1. tokens will be received via rpc channel.
+    //
+    if (enable_decode_response_to_service_) {
+      google::protobuf::Closure* done = brpc::NewCallback(
+          &handle_first_response, redirect_cntl, req_context, req_context->request()->stream, req_context->attempt());
+      channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
+      if (redirect_cntl->Failed()) {
+        LOG(ERROR) << "Redirect to instance error: "
+                   << redirect_cntl->ErrorText();
+        delete done;
+        delete redirect_cntl;
+        return;
+      }
+      return;
+    }
+    LOG(ERROR) << "No Implementation for non-rpc token receiving!";
+    return;
+  });
+}
+
+void XllmHttpServiceImpl::rehandle(std::shared_ptr<RequestContext> req_context) {
+  scheduler_->finish_request(req_context->request()->service_request_id);
+
+  std::string error;
+  llm::proto::CompletionRequest req_pb = llm::proto::CompletionRequest();
+
+  if (!json2pb::JsonToProtoMessage(*req_context->req_attachment(), &req_pb, &error)) {
+    LOG(ERROR) << "Parse json to proto failed: " << error;
+    req_context->finish_with_error(error);
+    return;
+  }
+
+  if (!req_pb.prompt().empty()) {
+    // select instance for request
+    if (!scheduler_->schedule(req_context->request())) {
+      LOG(ERROR) << "Schedule request failed!";
+      req_context->finish_with_error("Schedule request failed!");
+      return;
+    }
+  } else {
+    LOG(ERROR) << "Prompt is empty!";
+    req_context->finish_with_error("Prompt is empty!");
+    return;
+  }
+  
+  req_pb.mutable_routing()->set_prefill_name(
+      req_context->request()->routing.prefill_name);
+  req_pb.mutable_routing()->set_decode_name(
+      req_context->request()->routing.decode_name);
+
+  std::string req_attachment;
+  
+  if (!json2pb::ProtoMessageToJson(req_pb, &req_attachment, &error)) {
+    LOG(ERROR) << "Parse proto to json failed: " << error;
+    req_context->finish_with_error(error);
+    return;
+  }
+  req_context->set_req_attachment(std::make_shared<std::string>(req_attachment));
+  req_context->increment_attempt();
+
+  handle(req_context);
 }
 
 }  // namespace xllm_service

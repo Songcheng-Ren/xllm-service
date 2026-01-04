@@ -88,7 +88,8 @@ class StreamCallData : public CallData {
       controller_->http_response().SetHeader("Connection", "keep-alive");
       controller_->http_response().SetHeader("Cache-Control", "no-cache");
       // Done Run first for steam response
-      done_->Run();
+      if (done_ != nullptr)
+        done_->Run();
 
     } else {
       controller_->http_response().SetHeader("Content-Type",
@@ -102,7 +103,8 @@ class StreamCallData : public CallData {
   ~StreamCallData() {
     // For non stream response, call brpc done Run
     if (!stream_) {
-      done_->Run();
+      if (done_ != nullptr)
+        done_->Run();
     }
   }
 

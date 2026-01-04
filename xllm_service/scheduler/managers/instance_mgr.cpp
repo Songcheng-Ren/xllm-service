@@ -516,7 +516,17 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
           removed_instance_.insert(iter);
         }
       }
+
+      for (auto& iter : delete_list) {
+        if (instance_removed_cb_) {
+          auto name = iter; // or copy the deleted name
+          threadpool_.schedule([this, name]() {
+            instance_removed_cb_(name);
+          });
+        }
+      }
     }
+    broadcast_instance_removed_event(delete_list);
   });
 }
 
@@ -561,6 +571,42 @@ void InstanceMgr::update_load_metrics(const etcd::Response& response,
       }
     }
   });
+}
+
+void InstanceMgr::register_instance_removed_callback(InstanceRemovedCallback cb) {
+  instance_removed_cb_ = std::move(cb);
+}
+
+void InstanceMgr::broadcast_instance_removed_event(const std::vector<std::string>& instance_names) {
+  nlohmann::json req_json;
+  req_json["removed_instances"] = instance_names;
+  std::string req_body = req_json.dump();
+
+  std::shared_lock<std::shared_mutex> lock(inst_mutex_);
+
+  for (const auto& iter : cached_channels_) {
+    const std::string target_instance = iter.first;
+    std::shared_ptr<brpc::Channel> channel = iter.second;
+
+    threadpool_.schedule([this, target_instance, channel, req_body]() {
+      brpc::Controller* cntl = new brpc::Controller();  // 每个任务独立创建 controller
+      cntl->http_request().uri() = target_instance + "/instance_removed";
+      cntl->http_request().set_method(brpc::HTTP_METHOD_POST);
+      cntl->http_request().SetHeader("Content-Type", "application/json");
+      cntl->request_attachment().append(req_body);
+
+      channel->CallMethod(NULL, cntl, NULL, NULL, NULL);
+
+      if (cntl->Failed()) {
+        LOG(ERROR) << "Broadcast to instance " << target_instance 
+                   << " failed: " << cntl->ErrorText();
+      } else {
+        LOG(INFO) << "Broadcast to instance " << target_instance << " success";
+      }
+
+      delete cntl;
+    });
+  }
 }
 
 void InstanceMgr::update_latency_metrics(

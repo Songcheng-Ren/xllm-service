@@ -28,8 +28,11 @@ limitations under the License.
 #include "response_handler.h"
 #include "tokenizer/tokenizer.h"
 #include "tokenizer/tokenizer_args.h"
+#include "scheduler/request_context.h"
 
 namespace xllm_service {
+    
+using RequestRehandleCallback = std::function<void(std::shared_ptr<RequestContext>)>;
 
 // A scheduler for scheduling requests and instances
 class Scheduler final {
@@ -65,6 +68,14 @@ class Scheduler final {
 
   // handle generations from prefill/decode instance
   bool handle_generation(const llm::RequestOutput& request_output);
+
+  void handle_instance_removed(const std::string& instance_name);
+
+  bool record_new_request_context(std::shared_ptr<RequestContext> req_context);
+
+  void finish_request_context(const std::string& service_request_id);
+
+  void register_request_rehandle_callback(RequestRehandleCallback cb);
 
   // update request metrics for prefill finished request
   void update_request_metrics_for_prefill(
@@ -107,6 +118,11 @@ class Scheduler final {
   // `service request id` -> `request` map
   std::unordered_map<std::string, std::shared_ptr<Request>> requests_;
   std::mutex request_mutex_;
+
+  std::unordered_map<std::string, std::shared_ptr<RequestContext>> request_contexts_;
+  std::mutex request_context_mutex_;
+
+  RequestRehandleCallback request_rehandle_cb_;
 
   // use threadpool to handle all RequestOuputs queue
   static constexpr size_t kOutputTheadNum_ = 128;  // magic num

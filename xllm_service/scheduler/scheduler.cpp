@@ -40,6 +40,10 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
 
   instance_mgr_ =
       std::make_unique<InstanceMgr>(options, etcd_client_, is_master_service_);
+  instance_mgr_->register_instance_removed_callback(
+    [this](const std::string& instance_name) {
+      this->handle_instance_removed(instance_name);
+  });
 
   global_kvcache_mgr_ = std::make_shared<GlobalKVCacheMgr>(
       options, etcd_client_, is_master_service_);
@@ -297,6 +301,15 @@ void Scheduler::finish_request(const std::string& service_request_id,
   }
 }
 
+void Scheduler::finish_request_context(const std::string& service_request_id) {
+  LOG(INFO) << "Scheduler::finish_request_context for request id: "
+            << service_request_id;
+  {
+    std::lock_guard<std::mutex> guard(request_context_mutex_);
+    request_contexts_.erase(service_request_id);
+  }
+}
+
 bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
   const std::string& service_request_id = request_output.service_request_id;
   OutputCallback cb;
@@ -336,10 +349,44 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
        request_output = std::move(request_output)]() mutable {
         if (!cb(request_output) || request_output.finished) {
           finish_request(service_request_id);
+          finish_request_context(service_request_id);
         }
       });
 
   return true;
+}
+
+void Scheduler::handle_instance_removed(const std::string& instance_name) {
+  LOG(INFO) << "Scheduler::instance removed: " << instance_name;
+  for (const auto& req_ctx_pair : request_contexts_) {
+    auto req_context = req_ctx_pair.second;
+    if (req_context->is_instance_decode_used(instance_name)) {
+      LOG(INFO) << "Rehandle request: "
+                << req_context->request()->service_request_id
+                << " due to instance removed: " << instance_name;
+      if (request_rehandle_cb_) {
+        request_rehandle_cb_(req_context);
+      }
+    }
+  }
+}
+
+bool Scheduler::record_new_request_context(std::shared_ptr<RequestContext> req_context) {
+  std::lock_guard<std::mutex> guard(request_context_mutex_);
+  if (request_contexts_.find(req_context->request()->service_request_id) !=
+      request_contexts_.end()) {
+    LOG(ERROR)
+        << "The request context ID already exists. Requests with the same ID "
+           "are not allowed. "
+        << req_context->request()->service_request_id;
+    return false;
+  }
+  request_contexts_[req_context->request()->service_request_id] = req_context;
+  return true;
+}
+
+void Scheduler::register_request_rehandle_callback(RequestRehandleCallback cb) {
+  request_rehandle_cb_ = std::move(cb);
 }
 
 void Scheduler::update_request_metrics_for_prefill(

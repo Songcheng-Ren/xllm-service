@@ -33,6 +33,8 @@ limitations under the License.
 
 namespace xllm_service {
 
+using InstanceRemovedCallback = std::function<void(const std::string& instance_name)>;
+
 class InstanceMgr final {
  public:
   explicit InstanceMgr(const Options& options,
@@ -71,6 +73,10 @@ class InstanceMgr final {
   bool select_instance_pair_on_slo(std::shared_ptr<Request> request);
 
   void set_as_master();
+
+  void register_instance_removed_callback(InstanceRemovedCallback cb);
+
+  void broadcast_instance_removed_event(const std::vector<std::string>& instance_names);
 
  private:
   DISALLOW_COPY_AND_ASSIGN(InstanceMgr);
@@ -132,6 +138,8 @@ class InstanceMgr final {
   std::unordered_map<std::string, RequestMetrics> request_metrics_;
 
   ThreadPool threadpool_;
+
+  InstanceRemovedCallback instance_removed_cb_;
 };
 
 }  // namespace xllm_service
