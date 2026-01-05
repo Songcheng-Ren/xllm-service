@@ -526,7 +526,9 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
         }
       }
     }
-    broadcast_instance_removed_event(delete_list);
+    if (!delete_list.empty()) {
+      broadcast_instance_removed_event(delete_list);
+    }
   });
 }
 
